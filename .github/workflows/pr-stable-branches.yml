@@ -1,0 +1,72 @@
+name: Workflow for pull requests and stable branches
+on:
+  pull_request:
+    branches:
+      - 'master'
+  push:
+    branches:
+      - 'master'
+
+env:
+  VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [shell-windows-lib, shell-runner-osx, k8s-docker-runner]
+        build_type: [Debug, Release]
+        include:
+          - runner: k8s-docker-runner
+            image: "${{ vars.DOCKER_ADDR }}/build-box:centos7-clients"
+            profile: x86_64-linux-gnu
+          - runner: shell-runner-osx
+            profile: x86_64-macos
+          - runner: shell-windows-lib
+            profile: x86_64-windows
+
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Get GL Token
+        uses: imprivata-shared-tools/action-wrappers/getsentry/action-github-app-token@main
+        id: get_installation_token
+        with:
+          app_id: ${{ secrets.ROBOT_APP_ID }}
+          private_key: ${{ secrets.ROBOT_SSH_KEY }}
+
+      - name: Checkout repo
+        uses: imprivata-shared-tools/action-wrappers/actions/checkout@main
+        with:
+          ref: ${{ env.GITHUB_REF }}
+          fetch-depth: 0
+          token: ${{ steps.get_installation_token.outputs.token }}
+
+      - name: Import Secrets
+        id: secrets
+        uses: imprivata-shared-tools/action-wrappers/hashicorp/vault-action@main
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: approle
+          roleId: ${{ secrets.VAULT_ROLE_ID }}
+          secretId: ${{ secrets.VAULT_SECRET_ID }}
+          secrets: |
+            Developers/data/ci ARTIFACTORY_API_KEY | ARTIFACTORY_API_KEY;
+            Developers/data/ci ARTIFACTORY_CI_USER | ARTIFACTORY_CI_USER;
+
+      - name: Build artifacts
+        env:
+          CONAN_HOME: ${{ github.workspace }}
+        run: |
+          make PROFILE=${{ matrix.profile }} BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Deploy artifacts
+        env:
+          CONAN_HOME: ${{ github.workspace }}
+        if: contains(github.ref, 'master')
+        run: |
+          conan remote login -p ${{ env.ARTIFACTORY_API_KEY }} sl-artifactory ${{ env.ARTIFACTORY_CI_USER }}
+          conan upload "*" -r sl-artifactory -c
+          conan remote logout sl-artifactory
